@@ -1,0 +1,279 @@
+Backend (Apache + PHP)
+
+Files
+
+scripts/trends_pull.php  / downloads CSV, writes data/trends.csv + data/trends.json
+api/trends.php          / serves normalized trends JSON
+data/.gitkeep          / ensure folder exists in VCS
+
+
+Configure
+
+Edit scripts/trends_pull.php and replace:
+
+const TRENDS_CSV_URL = '<<PASTE_TRENDS_CSV_URL_HERE>>';
+
+
+Use the “Export → Download CSV” link from the Trends page (public, no auth).
+
+Manual run (Windows):--------------------------------------------------------
+
+"C:\PHP\php.exe" "C:\www\html\scripts\trends_pull.php"
+
+
+Schedule hourly (PowerShell, example):
+
+$PHP    = "C:\PHP\php.exe"
+$Script = "C:\www\html\scripts\trends_pull.php"
+$TaskName = "TrendsPullHourly"
+
+$Action  = New-ScheduledTaskAction -Execute $PHP -Argument $Script
+$Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration ([TimeSpan]::MaxValue)
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Description "Pull trends CSV hourly"
+
+
+Key mapping (robust header normalization)
+
+title ← title|query|searchterm|name
+
+link ← link|url|newsurl|shareurl|storyurl
+
+traffic← traffic|searches|volume
+
+date ← date|time
+
+Example: scripts/trends_pull.php
+
+<?php
+declare(strict_types=1);
+
+/**
+ * Downloads a CSV, normalizes headers/rows, writes:
+ *  - data/trends.csv  (raw cache)
+ *  - data/trends.json (normalized)
+ *
+ * Security notes:
+ * - URL is static/configured; no user input.
+ * - Timeouts + basic sanity checks.
+ * - JSON written atomically via temp file rename.
+ */
+
+const TRENDS_CSV_URL = '<<PASTE_TRENDS_CSV_URL_HERE>>';
+const DATA_DIR       = __DIR__ . '/../data';
+const CSV_PATH       = DATA_DIR . '/trends.csv';
+const JSON_PATH      = DATA_DIR . '/trends.json';
+
+// Ensure data dir
+if (!is_dir(DATA_DIR)) {
+    mkdir(DATA_DIR, 0755, true);
+}
+
+// Fetch CSV (with timeout)
+$ctx = stream_context_create(['http' => ['timeout' => 10, 'ignore_errors' => true]]);
+$csv = @file_get_contents(TRENDS_CSV_URL, false, $ctx);
+if ($csv === false || strlen($csv) < 10) {
+    fwrite(STDERR, "[trends] failed to download CSV\n");
+    exit(1);
+}
+
+// Save raw CSV cache
+file_put_contents(CSV_PATH, $csv);
+
+// Parse CSV
+$fh = fopen(CSV_PATH, 'r');
+if (!$fh) {
+    fwrite(STDERR, "[trends] failed to open CSV\n");
+    exit(1);
+}
+
+$headers = fgetcsv($fh);
+if (!$headers) {
+    fwrite(STDERR, "[trends] missing header row\n");
+    fclose($fh);
+    exit(1);
+}
+
+// Normalize headers (lowercase, strip spaces)
+$normHeaders = array_map(function($h) {
+    return strtolower(trim(preg_replace('/\s+/', '', (string)$h)));
+}, $headers);
+
+// Build lookup map for flexible keys
+function pickIndex(array $normHeaders, array $candidates): ?int {
+    foreach ($candidates as $c) {
+        $idx = array_search($c, $normHeaders, true);
+        if ($idx !== false) return $idx;
+    }
+    return null;
+}
+$titleIdx   = pickIndex($normHeaders, ['title','query','searchterm','name']);
+$linkIdx    = pickIndex($normHeaders, ['link','url','newsurl','shareurl','storyurl']);
+$trafficIdx = pickIndex($normHeaders, ['traffic','searches','volume']);
+$dateIdx    = pickIndex($normHeaders, ['date','time']);
+
+$rows = [];
+while (($row = fgetcsv($fh)) !== false) {
+    $title   = $titleIdx   !== null ? trim((string)($row[$titleIdx]   ?? '')) : '';
+    $link    = $linkIdx    !== null ? trim((string)($row[$linkIdx]    ?? '')) : '';
+    $traffic = $trafficIdx !== null ? trim((string)($row[$trafficIdx] ?? '')) : '';
+    $date    = $dateIdx    !== null ? trim((string)($row[$dateIdx]    ?? '')) : '';
+
+    if ($title === '' && $link === '') continue;
+
+    // Basic normalization
+    $trafficNum = is_numeric($traffic) ? (int)$traffic : null;
+
+    $rows[] = [
+        'title'   => $title,
+        'link'    => $link,
+        'traffic' => $trafficNum,
+        'date'    => $date,
+    ];
+}
+fclose($fh);
+
+// Write JSON atomically
+$tmp = JSON_PATH . '.tmp';
+file_put_contents($tmp, json_encode([
+    'updated_at' => gmdate('c'),
+    'count'      => count($rows),
+    'items'      => $rows,
+], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+rename($tmp, JSON_PATH);
+
+echo "[trends] wrote " . count($rows) . " rows\n";
+
+
+Example: api/trends.php
+
+<?php
+declare(strict_types=1);
+
+/**
+ * Read-only API serving normalized trends JSON.
+ * - CORS enabled (adjust origin for production)
+ * - Cache headers for CDN/browser
+ * - Graceful fallback if file missing
+ */
+
+const JSON_PATH = __DIR__ . '/../data/trends.json';
+
+// CORS (tighten in prod)
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type');
+
+// Preflight
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(204);
+    exit;
+}
+
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: public, max-age=300'); // 5 min
+
+if (!file_exists(JSON_PATH)) {
+    http_response_code(503);
+    echo json_encode(['error' => 'trends unavailable', 'items' => []]);
+    exit;
+}
+
+readfile(JSON_PATH);
+
+Frontend (React)-------------------------------------------------------
+
+File: src/components/TrendsCard.jsx
+
+import { useEffect, useState } from "react";
+
+export default function TrendsCard({ limit = 10, source = "/api/trends.php", fallback = "/data/trends.json" }) {
+  const [items, setItems] = useState([]);
+  const [updatedAt, setUpdatedAt] = useState(null);
+  const [err, setErr] = useState(null);
+
+  async function fetchJson(url) {
+    const r = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.json();
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        let data;
+        try {
+          data = await fetchJson(source);
+        } catch {
+          data = await fetchJson(fallback);
+        }
+        if (!cancelled && data) {
+          setItems((data.items || []).slice(0, limit));
+          setUpdatedAt(data.updated_at || null);
+        }
+      } catch (e) {
+        if (!cancelled) setErr(e.message);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [source, fallback, limit]);
+
+  return (
+    <div className="mt-4 p-4 rounded-2xl shadow bg-white">
+      <div className="flex items-baseline justify-between">
+        <h2 className="text-lg font-semibold">Trending</h2>
+        {updatedAt && <span className="text-xs opacity-60">Updated {new Date(updatedAt).toLocaleString()}</span>}
+      </div>
+      {err && <div className="text-sm text-red-600 mt-2">Failed to load trends: {err}</div>}
+      <ul className="mt-3 space-y-2">
+        {items.map((it, i) => (
+          <li key={i} className="flex items-start gap-2">
+            <span className="text-sm opacity-60 w-6 text-right">{i + 1}.</span>
+            <div className="flex-1">
+              <a className="text-sm font-medium hover:underline break-all" href={it.link} target="_blank" rel="noreferrer">
+                {it.title || it.link}
+              </a>
+              {typeof it.traffic === "number" && (
+                <div className="text-xs opacity-60">traffic: {it.traffic.toLocaleString()}</div>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+----------------------------------------------------------------
+Usage (dashboard)
+
+import TrendsCard from '../components/TrendsCard';
+
+export default function DashboardPage() {
+  return (
+    <main className="p-4">
+      {/* ... <Dashboard /> ... */}
+      <div className="mt-4">
+        <TrendsCard limit={10} source="/api/trends.php" fallback="/data/trends.json" />
+      </div>
+    </main>
+  );
+}
+-----------------------------------------------------------
+Security & Ops Notes
+
+No user input reaches the downloader or API; URL is fixed in code/config.
+
+Timeouts on HTTP fetch; atomic writes for JSON to avoid partial reads.
+
+Read-only API, no mutation; set tighter CORS in prod (Access-Control-Allow-Origin → your domain).
+
+Scheduling runs as a non-admin service user; data dir permissions 0755 (Linux) / equivalent.
+
+Logging: write to STDERR in the pull script; optionally route via Apache/PHP-FPM logs.
+-----------------------------------------------------------
+.gitignore (snippet)
+data/trends.json
+data/trends.csv
+.env
+*.log
