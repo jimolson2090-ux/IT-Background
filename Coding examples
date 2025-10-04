@@ -1,0 +1,34 @@
+Below is some of my coding ive worked on: 
+
+>Example API Endpoint (FastAPI)
+@app.post("/api/upload")
+async def upload_file(file: UploadFile):
+    # Save file securely
+    content = await file.read()
+    with open(f"/tmp/{file.filename}", "wb") as f:
+        f.write(content)
+    return {"status": "success", "filename": file.filename}
+
+>Database Model / Pydantic Example
+class User(BaseModel):
+    id: str
+    email: str
+    role: str
+    created_at: datetime
+
+>Rate Limiter / Security Middleware
+async def rate_limiter(request: Request, call_next):
+    ip = request.client.host
+    if limiter.too_many_requests(ip):
+        return JSONResponse(status_code=429, content={"error": "Too many requests"})
+    return await call_next(request)
+
+>Frontend Component (React + Tailwind)
+export default function DashboardCard({ title, value }) {
+  return (
+    <div className="p-4 rounded-2xl shadow-md bg-white">
+      <h2 className="text-lg font-semibold">{title}</h2>
+      <p className="text-2xl font-bold">{value}</p>
+    </div>
+  );
+}
